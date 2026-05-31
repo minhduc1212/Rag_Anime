@@ -1,0 +1,8 @@
+requests
+beautifulsoup4
+google-genai
+chromadb
+sentence_transformers
+tdqm
+openai
+tiktoken
