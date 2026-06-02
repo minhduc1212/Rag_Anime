@@ -6,3 +6,5 @@ sentence_transformers
 tdqm
 openai
 tiktoken
+fastapi
+uvicorn
