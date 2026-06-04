@@ -1,41 +1,126 @@
+"""
+rag_search.py — Anime RAG Search (OpenAI embed + Gemini LLM)
+=============================================================
+Applies structured query rewrite, safe response parsing, and strict LLM ranking
+from new_core.py while keeping the synchronous standalone architecture.
+"""
+
 import json
 import os
 import re
+import logging
 import dotenv
 import chromadb
+from dataclasses import dataclass
 from openai import OpenAI
 from google import genai
 from google.genai import types
 
 dotenv.load_dotenv()
 
-# ── Config ────────────────────────────────────────────────────────────────────
-EMBED_MODEL  = "text-embedding-3-small"
-DIMENSIONS   = 1536
-LLM_MODEL    = "gemma-4-31b-it"
-REWRITE_MODEL = "gemma-4-31b-it"
-CHROMA_PATH  = "./chroma_db"
-COLLECTION   = "anime_collection"
-TOP_K        = 20
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Dataclasses
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class AnimeResult:
+    rank: int
+    title: str
+    url: str
+    mal_score: float
+    why: str
+
+
+@dataclass
+class RetrievedItem:
+    title: str
+    url: str
+    relevance: float
+
+
+@dataclass
+class SearchResponse:
+    query: str
+    rewritten_query: str
+    excluded_titles: list[str]
+    message: str
+    recommendations: list[AnimeResult]
+    all_retrieved: list[RetrievedItem]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Config
+# ══════════════════════════════════════════════════════════════════════════════
+
+EMBED_MODEL    = "text-embedding-3-small"
+DIMENSIONS     = 1536
+LLM_MODEL      = "gemma-4-31b-it"
+REWRITE_MODEL  = "gemma-4-31b-it"
+CHROMA_PATH    = "./chroma_db"
+COLLECTION     = "anime_collection"
+TOP_K          = 20
 
 openai_client = OpenAI()
 genai_client  = genai.Client()
 
 
-# ── Init ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Helpers (from new_core.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _safe_text(response) -> str | None:
+    """
+    Extract text từ Gemini response an toàn.
+    response.text có thể raise hoặc trả None khi bị safety filter / MAX_TOKENS.
+    """
+    try:
+        if response.text is not None:
+            return response.text
+    except Exception:
+        pass
+    try:
+        for candidate in (response.candidates or []):
+            for part in (candidate.content.parts or []):
+                if hasattr(part, "text") and part.text:
+                    return part.text
+    except Exception:
+        pass
+    return None
+
+
+def _parse_json_response(raw: str | None, fallback: dict) -> dict:
+    """Parse JSON response, strip markdown fences, fallback nếu fail."""
+    if not raw:
+        return fallback
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("JSON decode failed, using fallback")
+        return fallback
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Init
+# ══════════════════════════════════════════════════════════════════════════════
 
 def init_chromadb():
     chroma = chromadb.PersistentClient(path=CHROMA_PATH)
     return chroma.get_collection(name=COLLECTION)
 
 
-# ── Embed query ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Embed query
+# ══════════════════════════════════════════════════════════════════════════════
 
 def embed_query(query: str) -> list[float]:
-    """
-    Embed query bằng text-embedding-3-small.
-    Dùng RETRIEVAL_QUERY task type để tối ưu độ chính xác tìm kiếm.
-    """
+    """Embed query bằng text-embedding-3-small."""
     response = openai_client.embeddings.create(
         model=EMBED_MODEL,
         input=query,
@@ -44,24 +129,40 @@ def embed_query(query: str) -> list[float]:
     return response.data[0].embedding
 
 
-# ── Query Rewrite ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Query Rewrite — STRUCTURED (from new_core.py)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def rewrite_query(query: str) -> dict:
     """
-    Dùng LLM để viết lại query cho search và trích xuất các title cần loại trừ.
+    Dùng LLM để phân tích query thành các trường có cấu trúc, rồi build
+    structured search string matching ChromaDB document format.
+
+    Trả về:
+      rewritten_query  — structured search string mirroring ChromaDB doc format
+      excluded_titles  — anime cần loại khỏi kết quả
     """
-    prompt = f"""You are an anime search assistant.
-User query: {query}
+    prompt = f"""You are an anime search assistant. Analyze the user query and extract structured fields.
 
-Tasks:
-1. Extract any specific anime titles mentioned in the query that the user wants to find similar anime to.
-2. Rewrite the query to be an optimal semantic search query for a vector database (describe the genres, themes, plot elements, tropes). Do NOT include the extracted titles in the rewritten query.
+User query: "{query}"
 
-Respond ONLY with this JSON structure (no markdown, no extra text):
+1. Extract any specific anime titles the user wants to find SIMILAR anime to -> excluded_titles.
+2. Fill each field below. Be specific; use terms that appear in anime databases.
+
+Respond ONLY with valid JSON, no markdown:
 {{
-  "rewritten_query": "The rewritten semantic search query",
-  "excluded_titles": ["title1", "title2"]
-}}"""
+  "excluded_titles": [],
+  "genres": "comma-separated genres, e.g. Action, Adventure, Fantasy",
+  "tags": "comma-separated tags, e.g. Isekai, Overpowered Protagonist, Magic System",
+  "setting": "e.g. fantasy world, post-apocalyptic city, high school, outer space",
+  "mood": "e.g. dark and gritty, wholesome, epic, comedic, melancholic",
+  "themes": "e.g. redemption, friendship, war, survival, romance, coming-of-age",
+  "plot_elements": "e.g. transported to another world, robot pilots, detective mystery, tournament arc",
+  "similar_to": "comma-separated well-known anime titles with a similar feel (not the excluded ones)",
+  "synopsis_keywords": "vivid descriptive phrases that would appear in a matching anime synopsis"
+}}
+
+Leave a field as empty string if not applicable."""
 
     try:
         response = genai_client.models.generate_content(
@@ -72,24 +173,51 @@ Respond ONLY with this JSON structure (no markdown, no extra text):
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.1,
+                max_output_tokens=600,
             ),
         )
 
-        raw = response.text.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+        raw  = _safe_text(response)
+        data = _parse_json_response(raw, {})
 
-        data = json.loads(raw)
+        excluded = data.get("excluded_titles") or []
+
+        # Build a structured search string that mirrors the ChromaDB document format.
+        # Documents are stored as:  genres: X \n tags: Y \n similar_to: Z \n synopsis: ...
+        # Matching this structure puts the query embedding in the same vector space.
+        parts = []
+        if data.get("genres"):
+            parts.append(f"genres: {data['genres']}")
+        if data.get("tags"):
+            parts.append(f"tags: {data['tags']}")
+        if data.get("setting"):
+            parts.append(f"setting: {data['setting']}")
+        if data.get("mood"):
+            parts.append(f"mood: {data['mood']}")
+        if data.get("themes"):
+            parts.append(f"themes: {data['themes']}")
+        if data.get("plot_elements"):
+            parts.append(f"plot_elements: {data['plot_elements']}")
+        if data.get("similar_to"):
+            parts.append(f"similar_to: {data['similar_to']}")
+        if data.get("synopsis_keywords"):
+            parts.append(f"synopsis: {data['synopsis_keywords']}")
+
+        rewritten = "\n".join(parts) if parts else query
+        log.info("Structured rewrite:\n%s", rewritten)
+
         return {
-            "rewritten_query": data.get("rewritten_query", query),
-            "excluded_titles": data.get("excluded_titles", [])
+            "rewritten_query": rewritten,
+            "excluded_titles": excluded,
         }
     except Exception as e:
-        print(f"⚠️ Query rewrite failed: {e}")
+        log.warning("Query rewrite failed: %s", e)
         return {"rewritten_query": query, "excluded_titles": []}
 
 
-# ── Search ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Vector Search — with collection.count() cap (from new_core.py)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def search(query: str, collection, top_k: int = TOP_K, excluded_titles: list[str] = None) -> list[dict]:
     """
@@ -98,54 +226,51 @@ def search(query: str, collection, top_k: int = TOP_K, excluded_titles: list[str
     """
     embedding = embed_query(query)
 
-    # Lấy dư ra để bù vào những kết quả bị filter
+    # Lấy dư 3× để bù cho những kết quả bị filter
     fetch_k = top_k * 3 if excluded_titles else top_k
 
     results = collection.query(
         query_embeddings=[embedding],
-        n_results=fetch_k,
+        n_results=min(fetch_k, collection.count()),
         include=["documents", "metadatas", "distances"],
     )
 
     docs      = results["documents"][0]
     metadatas = results["metadatas"][0]
-    distances = results["distances"][0]   # cosine distance (nhỏ hơn = gần hơn)
+    distances = results["distances"][0]
 
-    # Kết hợp + sắp xếp theo relevance score (1 - distance)
+    excluded_lower = [t.lower() for t in (excluded_titles or [])]
+
     combined = []
     for doc, meta, dist in zip(docs, metadatas, distances):
-        # Metadata Filtering (ILIKE '%title%')
-        if excluded_titles:
+        if excluded_lower:
             title = str(meta.get("title", "")).lower()
-            skip = False
-            for ex_title in excluded_titles:
-                if ex_title.lower() in title:
-                    skip = True
-                    break
-            if skip:
+            if any(ex in title for ex in excluded_lower):
                 continue
-
         combined.append({
             "doc":       doc,
             "meta":      meta,
-            "relevance": round(1 - dist, 4),   # 0–1, càng cao càng liên quan
+            "relevance": round(1 - dist, 4),
         })
 
     # Sort: ưu tiên relevance trước, sau đó score MAL
-    combined.sort(key=lambda x: (x["relevance"], float(x["meta"].get("score", 0))), reverse=True)
-    
-    # Trả về đúng số lượng top_k yêu cầu
+    combined.sort(
+        key=lambda x: (x["relevance"], float(x["meta"].get("score", 0))),
+        reverse=True,
+    )
     return combined[:top_k]
 
 
-# ── Build context ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Build context
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_context(results: list[dict]) -> str:
     lines = []
     for i, r in enumerate(results, 1):
         m = r["meta"]
         lines.append(
-            f"[{i}] {m.get('title', '?')}  "
+            f"[{i}] {m.get('title', '?')} "
             f"(MAL score: {m.get('score', '?')} | relevance: {r['relevance']})\n"
             f"{r['doc']}\n"
             f"URL: {m.get('url', '')}\n"
@@ -153,37 +278,37 @@ def build_context(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  LLM — strict prompt forcing ALL N ranked (from new_core.py)
+# ══════════════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """You are an expert anime recommender assistant.
-Your job is to analyze the retrieved anime list and answer the user's question accurately.
+SYSTEM_PROMPT = (
+    "You are an expert anime recommender. "
+    "Analyze the retrieved list and answer accurately. "
+    "Base answers ONLY on context. Rank by intent match, not score. "
+    "Always respond in the EXACT JSON format. No text outside JSON."
+)
 
-Rules:
-- Base your answer ONLY on the provided context.
-- Rank recommendations by how well they match the user's intent, NOT just by MAL score.
-- Be specific about WHY each anime matches the query.
-- If the context lacks relevant results, say so honestly.
-- Always respond in the EXACT JSON format specified. No extra text outside JSON.
-"""
 
 def ask_llm(query: str, results: list[dict]) -> dict:
     context = build_context(results)
+    n       = len(results)
 
-    prompt = f"""Context (retrieved anime, sorted by relevance):
+    prompt = f"""Context ({n} anime retrieved, sorted by relevance):
 {context}
 
 User query: {query}
 
-Respond ONLY with this JSON structure (no markdown, no extra text):
+Respond ONLY with JSON:
 {{
-  "message": "Your detailed answer explaining recommendations and why they match the query.",
+  "message": "Detailed answer explaining recommendations.",
   "recommendations": [
     {{
       "rank": 1,
       "title": "Anime Title",
       "url": "https://myanimelist.net/...",
       "mal_score": 8.5,
-      "why": "One sentence explaining why this matches the query."
+      "why": "One sentence why this matches."
     }}
   ],
   "all_retrieved": [
@@ -191,45 +316,61 @@ Respond ONLY with this JSON structure (no markdown, no extra text):
   ]
 }}
 
-- `recommendations`: top picks that best match the query (max 10, ordered by fit).
-- `all_retrieved`: ALL {len(results)} anime from context, in order received.
-"""
+recommendations: You MUST include EXACTLY {n} entries — rank ALL {n} retrieved anime from best to worst match. Do NOT skip or omit any. all_retrieved: ALL {n} anime in the same order."""
 
-    response = genai_client.models.generate_content(
-        model=LLM_MODEL,
-        contents=[
-            types.Content(role="user", parts=[types.Part(text=SYSTEM_PROMPT + "\n\n" + prompt)])
+    fallback = {
+        "message": "Could not generate answer.",
+        "recommendations": [],
+        "all_retrieved": [
+            {"title": r["meta"].get("title", ""), "url": r["meta"].get("url", ""), "relevance": r["relevance"]}
+            for r in results
         ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            max_output_tokens=8192,
-            temperature=0.1,
-        ),
-    )
-
-    raw = response.text.strip()
-
-    # Strip markdown code fences nếu model trả về ```json ... ```
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    }
 
     try:
-        with open("result.json", "w", encoding="utf-8") as f:
-            json.dump({"raw": raw}, f, indent=2, ensure_ascii=False)
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Fallback: trả nguyên text trong message
-        return {
-            "message": raw,
-            "recommendations": [],
-            "all_retrieved": [
-                {"title": r["meta"].get("title", "?"), "url": r["meta"].get("url", ""), "relevance": r["relevance"]}
-                for r in results
+        response = genai_client.models.generate_content(
+            model=LLM_MODEL,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=SYSTEM_PROMPT + "\n\n" + prompt)]
+                )
             ],
-        }
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                max_output_tokens=8192,
+                temperature=0.1,
+            ),
+        )
+
+        raw = _safe_text(response)
+        if not raw:
+            try:
+                reason = response.candidates[0].finish_reason
+                log.warning("LLM blocked: finish_reason=%s", reason)
+            except Exception:
+                pass
+            return fallback
+
+        parsed = _parse_json_response(raw, fallback)
+
+        # Save raw result for debugging
+        try:
+            with open("result.json", "w", encoding="utf-8") as f:
+                json.dump({"raw": raw}, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+        return parsed
+
+    except Exception as e:
+        log.error("LLM error: %s", e)
+        return fallback
 
 
-# ── Display ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Display
+# ══════════════════════════════════════════════════════════════════════════════
 
 def display(answer: dict):
     print("\n" + "═" * 60)
@@ -252,7 +393,9 @@ def display(answer: dict):
     print("═" * 60)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Main
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     print("Connecting to ChromaDB…")
@@ -282,7 +425,7 @@ def main():
             rewrite_res = rewrite_query(query)
             rewritten_q = rewrite_res.get("rewritten_query", query)
             excluded_titles = rewrite_res.get("excluded_titles", [])
-            
+
             if excluded_titles:
                 print(f"   Excluded titles: {', '.join(excluded_titles)}")
             print(f"   Rewritten query: {rewritten_q}")
@@ -293,7 +436,7 @@ def main():
             answer  = ask_llm(query, results)
             display(answer)
         except Exception as e:
-            print(f"❌ Error: {e}")
+            log.error("Error: %s", e)
 
 
 if __name__ == "__main__":
